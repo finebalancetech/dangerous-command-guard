@@ -1,0 +1,99 @@
+# Dangerous Command Guard - Example Patterns
+#
+# Copy to ~/.config/opencode/dangerous-command-patterns and edit to taste.
+# One pattern per line. Lines starting with # are comments.
+#
+# Pattern formats:
+#   - Regex with flags: /rm\s+-[rf]/i
+#   - Simple regex: rm\s+-[rf]
+#   - Simple string: rm -rf (will be escaped)
+#
+# Remove patterns from this file to allow those commands.
+
+# Shell / filesystem destruction
+/rm\s+-[rf]/i
+/rm\s+-rf\s*\/(?:home|root|etc|usr|var|opt)/i
+/dd\s+of=\/dev/i
+/mkfs\s+/i
+/chmod\s+-R\s*777/i
+/:.*\|.*>&-/i
+
+# SQL destruction
+/DROP\s+TABLE/i
+/DROP\s+DATABASE/i
+/DROP\s+SCHEMA/i
+/TRUNCATE\s+TABLE/i
+/DELETE\s+FROM\s+\w+\s*(?:WHERE\s+1=1|;|\s*$)/i
+/DELETE\s+FROM\s+\w+\s*(?:"|'|\s*$)/i
+/ALTER\s+TABLE\s+\w+\s+DROP/i
+
+# Git destruction
+/git\s+push\s+--force/i
+/git\s+branch\s+-D/i
+/git\s+reset\s+--hard/i
+
+# Docker destruction
+/docker\s+rm\s+-f/i
+/docker\s+rmi\s+-f/i
+/docker\s+system\s+prune\s+-a/i
+
+# System / kernel level
+/fdisk/i
+/parted/i
+/umount/i
+/swapon/i
+/swapoff/i
+/sysctl/i
+/modprobe/i
+/rmmod/i
+
+# Data destruction
+/shred/i
+/wipe/i
+/srm/i
+/dd\s+if=\/dev\/zero/i
+
+# User / authentication
+/userdel/i
+/usermod/i
+/passwd/i
+/\bchage\b/i
+/groupdel/i
+
+# Process / service control
+/service.*stop/i
+/init\s+0/i
+/reboot/i
+
+# Configuration files
+/rm\s+\/etc\//i
+/rm\s+\/usr\//i
+/rm\s+\/var\//i
+/>\s+\/etc\//i
+/echo\s+""\s+>\s+\/etc\//i
+
+# Package management
+/apt-get\s+remove/i
+/apt-get\s+purge/i
+/yum\s+remove/i
+/dnf\s+remove/i
+/brew\s+uninstall/i
+/pip\s+uninstall/i
+
+# Database specific
+/VACUUM\s+FULL/i
+/REINDEX/i
+
+# Network / security
+/iptables\s+-F/i
+/ufw\s+disable/i
+
+# Development / build
+/make\s+distclean/i
+
+# Python-specific dangerous operations
+/shutil\.rmtree/i
+/rmtree/i
+
+# Test pattern (benign but for testing)
+/test-dangerous-command/i
