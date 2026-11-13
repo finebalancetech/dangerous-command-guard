@@ -14,6 +14,55 @@ const AUDIT_LOG = join(homedir(), 'dangerous-command-audit.jsonl');
 // Log every tool call, not just dangerous ones
 const LOG_SAFE_COMMANDS = true;
 
+// ---------------------------------------------------------------------------
+// v5 chat-gate — one-shot approvals. A regex match blocks the command, stops
+// the session, and explains in the chat. The user can then reply a simple
+// approval word ("allow", "yes", "go ahead", ...) which approves *the last
+// blocked command exactly once* — no need to retype it. `guard allow
+// <command>` also works as the explicit form. Every approval is consumed on
+// first use, so nothing is ever allowed for the whole session.
+// ---------------------------------------------------------------------------
+const approvedOnce = new Map();   // sessionID -> Set<command> (unconsumed)
+const lastBlocked = new Map();    // sessionID -> { command, name, category, ts }
+const ALLOW_WINDOW_MS = 15 * 60 * 1000; // bare "allow" only works right after a block
+
+// A bare approval word only has effect while a recent blocked command exists.
+const APPROVAL_WORDS_RE = /^(allow|allow it|approve|approved|allowed|ok|okay|yes|yep|yeah|go ahead|run it|run it anyway|do it|fine|sure|let it run)[.!]*$/i;
+
+function grantApproval(sessionID, command) {
+  if (!sessionID || !command) return;
+  if (!approvedOnce.has(sessionID)) approvedOnce.set(sessionID, new Set());
+  approvedOnce.get(sessionID).add(command);
+  lastBlocked.delete(sessionID);
+}
+
+function consumeApproval(sessionID, command) {
+  const set = approvedOnce.get(sessionID);
+  if (!set || !set.has(command)) return false;
+  set.delete(command);
+  if (set.size === 0) approvedOnce.delete(sessionID);
+  return true;
+}
+
+/**
+ * Parse a "guard allow <command>" approval from a chat message. Scans line by
+ * line so quoted/blockquoted message text (which commonly contains the words
+ * "guard allow" inside the blocked-message explainer) never matches — only a
+ * line that itself starts with "guard allow" is taken, and the command is the
+ * rest of that single line.
+ */
+function parseGuardAllow(text) {
+  const lines = String(text ?? '').split('\n');
+  for (const raw of lines) {
+    const line = raw.replace(/^\s*(?:>\s*)+/, '').trim();
+    const m = line.match(/^guard\s+allow\s*:?\s+(.+?)\s*$/i);
+    if (!m) continue;
+    let cmd = m[1].trim().replace(/^`|`$/g, '').replace(/^"+|"+$/g, '');
+    if (cmd && !/\r|\n/.test(cmd)) return cmd;
+  }
+  return null;
+}
+
 /**
  * After a dangerous command is denied, stop the session so the agent does not
  * continue with any other work until the user intervenes. `resume: false`
@@ -47,7 +96,7 @@ function formatBlockedMessage(dangerous, toolID) {
     'This command has been blocked because it matches a dangerous pattern.',
     '',
     '**What would you like to do?**',
-    '1. **Allow this specific command** — re-run it yourself, or edit the patterns file',
+    '1. **Allow this command once** — reply: `allow`',
     '2. **Skip this task** — stop working on this approach entirely',
     '3. **Revise the approach** — use a safer method to achieve the same goal',
   ].join('\n');
@@ -223,6 +272,30 @@ export default {
   async setup(ctx) {
     const wrapped = [];
 
+    // v5 chat-gate: watch user messages for an explicit "guard allow
+    // <command>" approval. Rewrites the prompt so the agent does not treat the
+    // directive as a task instruction.
+    await ctx.session.hook('prompt', (event) => {
+      const sid = event?.sessionID ?? null;
+      const text = event?.prompt?.text ?? '';
+      let approved = null;
+
+      const explicit = parseGuardAllow(text);
+      if (explicit) {
+        approved = explicit;
+      } else if (sid && APPROVAL_WORDS_RE.test(text.trim())) {
+        // Bare approval word: applies to the most recent blocked command,
+        // and only while it is still fresh.
+        const lb = lastBlocked.get(sid);
+        if (lb && Date.now() - lb.ts <= ALLOW_WINDOW_MS) approved = lb.command;
+      }
+      if (!approved) return;
+
+      grantApproval(sid, approved);
+      event.prompt.text = `[dangerous-command-guard] The user allowed \`${approved}\` once. You may run exactly that command one time; it will be blocked again afterwards.`;
+      void logToAudit({ status: 'approved_chat', sid, cmd: approved, oneShot: true });
+    });
+
     await ctx.tool.transform((editor) => {
       for (const tool of editor.list()) {
         const originalExecute = tool.execute;
@@ -254,44 +327,31 @@ export default {
                 throw new Error(`Dangerous command blocked: ${match.name} (category: ${match.category}). No session context available to request permission.`);
               }
 
-              // 1. explain in the conversation, 2. stop the agent flow, 3. fail the tool.
-              await notifySession(ctx, sessionID, formatBlockedMessage(match, toolID));
-
-              // Ask through OpenCode's native permission service instead of failing outright.
-              // - deny  -> throws BlockedError (tool fails closed)
-              // - ask   -> awaits the user's once / always / reject reply
-              // - allow -> resolves, and we fall through to the real execution
-              const invocationSource = context?.messageID && context?.id ? { type: 'tool', messageID: context.messageID, id: context.id } : undefined;
-              try {
-                await ctx.permission.assert({
-                  sessionID,
-                  action: toolID,
-                  resources: [command],
-                  metadata: { pattern: match.name, category: match.category, tool: toolID, cmd: command },
-                  ...(invocationSource ? { source: invocationSource } : {}),
-                });
-              } catch (err) {
-                // User rejected the permission ask. Stop the session so the agent
-                // does not keep working until the user intervenes, then rethrow.
+              // v5 chat-gate: a one-shot chat approval lets the exact command
+              // run once; otherwise explain in the conversation, stop the
+              // agent flow, and fail the tool. The decision is made in the
+              // chat (not the permission prompt) so a client-side "Accept All"
+              // cannot auto-approve or bypass it.
+              if (consumeApproval(sessionID, command)) {
                 await logToAudit(makeAuditEntry(toolID, context, {
-                  status: 'denied', pattern: match.name, category: match.category, cmd: command,
-                  reason: String(err?.message ?? err),
+                  status: 'allowed_once',
+                  pattern: match.name,
+                  category: match.category,
+                  cmd: command,
                 }));
+              } else {
+                // Remember the blocked command so a bare "allow" reply can
+                // approve it exactly once, then explain, stop, and fail.
+                lastBlocked.set(sessionID, { command, name: match.name, category: match.category, ts: Date.now() });
+                await notifySession(ctx, sessionID, formatBlockedMessage(match, toolID));
                 await maybeStopSession(ctx, sessionID);
-                throw err;
+                throw new Error(
+                  `🚫 DANGEROUS COMMAND BLOCKED\n` +
+                  `Category: ${match.category}\n` +
+                  `Pattern: ${match.name}\n\n` +
+                  `A message has been added to the conversation. Reply \`allow\` to run this command once, or STOP all work and wait for user instructions.`,
+                );
               }
-              // Dangerous commands must not run unless explicitly permitted by a human.
-              // Accept-all / unattended auto-approves permission asks, so enforce the
-              // deny here to keep the guard effective even in accept-all mode. Stop
-              // the session so the agent does not continue with other work.
-              await logToAudit(makeAuditEntry(toolID, context, { status: 'denied_accept_all_or_user_denied', pattern: match.name, category: match.category, cmd: command }));
-              await maybeStopSession(ctx, sessionID);
-              throw new Error(
-                `🚫 DANGEROUS COMMAND BLOCKED\n` +
-                `Category: ${match.category}\n` +
-                `Pattern: ${match.name}\n\n` +
-                `A message has been added to the conversation. STOP all work and wait for user instructions.`,
-              );
             }
 
             // Safe command (or a tool with no command text / an allowed dangerous command)

@@ -5,35 +5,52 @@ Backup of v3.1.0: `~/.config/opencode-backups/dangerous-command-guard-3.1.0/`
 Audit log: `~/dangerous-command-audit.jsonl`
 Patterns file: `~/.config/opencode/dangerous-command-patterns`
 
-## Current state (v3.1.0 + "stop session on deny")
+## v5.0.0 (current) — chat-gate
 
-Behavior model — *force-fail*: a matched dangerous command never runs without an
-explicit human decision. On a match the guard:
+Goal (from the user): a regex match *always* stops and asks, even with
+"Accept All" enabled, and respects the user's decision
+(allow / deny / suggest an alternative).
 
-1. logs `pending_approval` to the audit log,
-2. calls `ctx.permission.assert(...)` (native once / always / reject prompt in
-   default "prompt" permission mode; silently auto-approved in accept-all mode),
-3. always throws a `Dangerous command guard blocked` error — even if a rule or
-   the client auto-approved the ask.
+Behavior on a matched dangerous command:
 
-**Addition since the v3.1.0 backup:** on a deny the guard (1) injects a blocked
-message into the conversation (`session.prompt` with `resume: false`, so the
-message lands without resuming the agent loop — v2's `noReply` does not exist in
-2.2.7 and was silently stripped, `resume: false` is its modern equivalent), and
-(2) calls `ctx.session.interrupt({ sessionID, resume: false })` so the agent
-stops doing any other work until the user intervenes. Both are applied on both
-deny outcomes:
+1. logs `pending_approval`,
+2. if the exact command was **approved in the chat** (`guard allow <command>`)
+   it runs; otherwise
+3. injects the 🚫 blocked-message explainer into the conversation
+   (`session.prompt` with `resume: false` — the message lands without resuming
+   the agent loop; 2.2.7's schema has no `noReply`, `resume: false` is its
+   modern equivalent), and
+4. calls `session.interrupt({ sessionID, resume: false })` so the agent stops
+   doing any other work until the user intervenes, then throws the 🚫 error.
 
-- the user rejected the permission ask (`denied` in the audit log), and
-- the force-fail path (`denied_accept_all_or_user_denied`).
+The decision is made **in the chat, not the permission prompt**, so a
+client-side "Accept All" (`session.permissions = "autoaccept"`) cannot
+auto-approve or bypass it. Approvals are **one-shot**: replying a bare approval
+word ("allow", "yes", "go ahead", ...) approves *the most recent blocked
+command exactly once* — no need to retype it — and `guard allow <command>`
+works as the explicit form. The approval is consumed on first use, so nothing
+is ever allowed for the whole session. The prompt hook
+(`ctx.session.hook("prompt")`, which exposes the session id) parses the
+approval, applies it to the last blocked command (only while it is fresh, 15
+minutes), and rewrites the prompt so the agent does not treat the directive as
+a task instruction. Quoted/blockquoted message text can never match.
 
-The injected message and the thrown error are copied from v2.0.0: the 🚫
-**Dangerous Command Guard** explainer with category, matched pattern, the
-blocked command, and the "Allow / Skip / Revise" options.
+Trade-off: the native once / always / reject permission buttons are gone for
+matched commands — the decision is a chat reply. There is no way to keep the
+native buttons *and* guarantee the stop under Accept All, because the mode is
+not detectable from the plugin API.
 
-Known limitation (unchanged from v3.1.0): in accept-all mode the permission ask
-is auto-approved by the client and the guard force-fails without showing any UI,
-so the user cannot review-and-allow from the prompt.
+## v3.1.0 + "stop session on deny" (superseded by v5)
+
+Behavior model — *force-fail*: a matched dangerous command never runs. On a
+match the guard logged `pending_approval`, called `ctx.permission.assert(...)`
+(native prompt in "prompt" mode; auto-approved silently in accept-all mode), and
+then **always** threw — even when a real human clicked "Allow once/always".
+That was deliberate (protect against accept-all auto-approve) but it meant an
+explicit approval was ignored, which the user reported as a bug. This is the
+reason v5 moved the decision out of the permission system.
+
+The 🚫 message text was ported from v2.0.0.
 
 ## v4.0.0 (attempted, reverted)
 
@@ -68,34 +85,12 @@ Conclusion: under Accept All, `ask` is always swallowed by the client. The only
 server-side effect always enforced is `deny`, and `session.interrupt` works
 regardless of client mode. Therefore an "always ask" that beats accept-all is
 not possible through the permission system — the decision must move outside it
-(into the chat), which is the v5 design below.
-
-## v5 (recommended, not implemented)
-
-Goal: *always* stop and ask on a regex match, even with Accept All enabled, and
-respect the user's decision (allow / deny / suggest an alternative).
-
-- Keep the evaluate hook → `ask` (nice native prompt in "prompt" mode).
-- On match: deny the command (throw with pattern + category + suggested
-  alternative) and `session.interrupt({ sessionID, resume: false })` — works in
-  every mode because interrupt is not a permission.
-- The decision happens in the chat: the user replies to approve, deny, or
-  suggest a safer command (e.g. `git push --force-with-lease`).
-- Allowlist override so an explicit approval is honored: watch user messages via
-  `ctx.session.hook("context")` (same mechanism the jev-router plugin uses; note
-  the context event does not expose a session id, so attribute to the active
-  session when unambiguous). A reply like `guard allow <command>` stores the
-  command hash for the session and lets the next attempt run.
-
-Trade-off: in "prompt" mode the native once / always / reject buttons are lost —
-the decision moves to the chat. There is no way to keep the native buttons *and*
-guarantee the stop under Accept All, because the mode is not detectable from the
-plugin API.
+(into the chat), which is the v5 design above.
 
 ## Testing
 
-A throwaway harness (`guard-v4-test.mjs`, temp dir) simulates a fake `ctx`
-(permission.hook/assert, tool.transform, session.interrupt) against the plugin
-to verify: hook escalation, deny respect, native gate for `shell`, guard assert
-for non-shell tools, deny → interrupt, safe pass-through. Re-run it after any
+Throwaway harnesses (temp dir) simulate a fake `ctx`
+(session.hook/prompt/interrupt, tool.transform) against the plugin to verify:
+block → notify + interrupt + throw, `guard allow` parsing + prompt rewrite,
+approved command runs, session scoping, benign pass-through. Re-run after any
 change to the plugin's setup path.
